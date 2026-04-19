@@ -1,0 +1,16 @@
+services:
+  postgres:
+    build:
+      context: ./db
+    container_name: sqlite_cve_lab_db
+    environment:
+      POSTGRES_DB: sqlite_cve_lab
+      POSTGRES_USER: lab_user
+      POSTGRES_PASSWORD: lab_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

@@ -1,0 +1,5 @@
+beautifulsoup4==4.12.3
+jsonschema==4.25.1
+python-dateutil==2.9.0.post0
+psycopg[binary]==3.2.9
+requests==2.32.4
