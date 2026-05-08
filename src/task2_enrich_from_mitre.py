@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from common import (
     CVE_RECORD_URL,
     RESULTS_DIR,
     ensure_results_dir,
     extract_cpe_list,
+    extract_cwe_fallbacks,
     extract_cwe_ids,
     extract_cvss_list,
     fetch_cve_record,
@@ -21,7 +20,6 @@ INPUT_FILE = RESULTS_DIR / "result_task_1.json"
 OUTPUT_FILE = RESULTS_DIR / "result_task_2.json"
 
 
-
 def enrich_records(task1_records: list[dict]) -> list[dict]:
     enriched: list[dict] = []
 
@@ -30,9 +28,14 @@ def enrich_records(task1_records: list[dict]) -> list[dict]:
         record = fetch_cve_record(cve_id)
         metadata = record.get("cveMetadata", {})
 
+        cwe_fallbacks = extract_cwe_fallbacks(record)
         cwe_map: dict[str, dict[str, str]] = {}
-        for cwe_id in extract_cwe_ids(record):
-            cwe_map[cwe_id] = fetch_cwe_info(cwe_id)
+        for current_cwe_id in extract_cwe_ids(record):
+            cwe_map[current_cwe_id] = fetch_cwe_info(
+                current_cwe_id,
+                fallback=cwe_fallbacks.get(current_cwe_id),
+                retries=3,
+            )
 
         enriched.append(
             {

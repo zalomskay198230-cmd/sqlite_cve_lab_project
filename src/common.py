@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urljoin
 
 import requests
@@ -37,7 +38,7 @@ _SESSION = requests.Session()
 _SESSION.headers.update(
     {
         "User-Agent": (
-            "SQLite-CVE-Lab/1.0 "
+            "SQLite-CVE-Lab/1.1 "
             "(educational project; contact: local-user@example.invalid)"
         )
     }
@@ -49,17 +50,40 @@ def ensure_results_dir() -> None:
 
 
 
-def request_text(url: str, timeout: int = 30) -> str:
-    response = _SESSION.get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.text
+def request_text(url: str, timeout: int = 30, retries: int = 3, backoff: float = 1.5) -> str:
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = _SESSION.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response.text
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt == retries:
+                break
+            time.sleep(backoff * attempt)
+    raise DataCollectionError(f"Не удалось получить текст по URL {url}: {last_error}")
 
 
 
-def request_json(url: str, timeout: int = 30) -> dict[str, Any] | list[Any]:
-    response = _SESSION.get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
+def request_json(
+    url: str,
+    timeout: int = 30,
+    retries: int = 3,
+    backoff: float = 1.5,
+) -> dict[str, Any] | list[Any]:
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = _SESSION.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt == retries:
+                break
+            time.sleep(backoff * attempt)
+    raise DataCollectionError(f"Не удалось получить JSON по URL {url}: {last_error}")
 
 
 
@@ -144,29 +168,113 @@ def fetch_cve_record(cve_id: str) -> dict[str, Any]:
 
 
 
-def fetch_cwe_info(cwe_id: str) -> dict[str, str]:
+def iter_container_objects(record: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    containers = record.get("containers", {})
+    if not isinstance(containers, dict):
+        return
+
+    for value in containers.values():
+        if isinstance(value, dict):
+            yield value
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    yield item
+
+
+
+def fetch_cwe_info(
+    cwe_id: str,
+    fallback: dict[str, str] | None = None,
+    retries: int = 3,
+) -> dict[str, str]:
+    default_fallback = fallback or {"name": "Unknown", "description": "Unknown"}
+
     match = CWE_RE.fullmatch(cwe_id)
     if not match:
-        return {"name": "Unknown", "description": "Unknown"}
+        return default_fallback
 
     cwe_number = match.group(1)
     url = CWE_API_URL.format(cwe_number=cwe_number)
-    try:
-        data = request_json(url)
-    except Exception:
-        return {"name": "Unknown", "description": "Unknown"}
 
-    if not isinstance(data, dict):
-        return {"name": "Unknown", "description": "Unknown"}
+    for attempt in range(1, retries + 1):
+        try:
+            data = request_json(url, retries=1)
+        except Exception:
+            if attempt == retries:
+                return default_fallback
+            time.sleep(1.5 * attempt)
+            continue
 
-    weaknesses = data.get("Weaknesses") or []
-    if not weaknesses:
-        return {"name": "Unknown", "description": "Unknown"}
+        if not isinstance(data, dict):
+            if attempt == retries:
+                return default_fallback
+            time.sleep(1.5 * attempt)
+            continue
 
-    weakness = weaknesses[0]
-    name = (weakness.get("Name") or "Unknown").strip()
-    description = (weakness.get("Description") or "Unknown").strip()
-    return {"name": name, "description": description}
+        weaknesses = data.get("Weaknesses") or []
+        if not weaknesses:
+            if attempt == retries:
+                return default_fallback
+            time.sleep(1.5 * attempt)
+            continue
+
+        weakness = weaknesses[0]
+        name = str(weakness.get("Name") or "").strip()
+        description = str(weakness.get("Description") or "").strip()
+        if name and description:
+            return {"name": name, "description": description}
+
+        if attempt < retries:
+            time.sleep(1.5 * attempt)
+
+    return default_fallback
+
+
+
+def extract_cwe_fallbacks(record: dict[str, Any]) -> dict[str, dict[str, str]]:
+    result: dict[str, dict[str, str]] = {}
+
+    for container in iter_container_objects(record):
+        problem_types = container.get("problemTypes", [])
+        if not isinstance(problem_types, list):
+            continue
+
+        for problem_type in problem_types:
+            if not isinstance(problem_type, dict):
+                continue
+            descriptions = problem_type.get("descriptions", [])
+            if not isinstance(descriptions, list):
+                continue
+
+            for item in descriptions:
+                if not isinstance(item, dict):
+                    continue
+
+                cwe_id = item.get("cweId")
+                if not isinstance(cwe_id, str) or not CWE_RE.fullmatch(cwe_id):
+                    text = " ".join(str(item.get(field, "")) for field in ("description", "value", "name"))
+                    match = CWE_RE.search(text)
+                    if not match:
+                        continue
+                    cwe_id = f"CWE-{match.group(1)}"
+
+                text = " ".join(str(item.get(field, "")) for field in ("description", "value", "name")).strip()
+                name = text
+                if text.upper().startswith(cwe_id.upper()):
+                    name = text[len(cwe_id):].strip(" :-") or text
+
+                result[cwe_id] = {
+                    "name": name or default_name_from_cwe_id(cwe_id),
+                    "description": text or default_name_from_cwe_id(cwe_id),
+                }
+
+    return result
+
+
+
+def default_name_from_cwe_id(cwe_id: str) -> str:
+    return cwe_id
 
 
 
@@ -179,11 +287,7 @@ def first_non_empty(*values: Any) -> Any:
 
 
 def find_english_description(record: dict[str, Any]) -> str | None:
-    containers = record.get("containers", {})
-    for container_name in ("cna", "adp"):
-        container = containers.get(container_name)
-        if not isinstance(container, dict):
-            continue
+    for container in iter_container_objects(record):
         descriptions = container.get("descriptions", [])
         for item in descriptions:
             if not isinstance(item, dict):
@@ -198,7 +302,6 @@ def find_english_description(record: dict[str, Any]) -> str | None:
 
 
 def extract_cvss_list(record: dict[str, Any]) -> list[dict[str, Any]]:
-    containers = record.get("containers", {})
     result: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
 
@@ -206,10 +309,7 @@ def extract_cvss_list(record: dict[str, Any]) -> list[dict[str, Any]]:
         cleaned = metric_key.replace("_", "").lower()
         return cleaned
 
-    for container_name in ("cna", "adp"):
-        container = containers.get(container_name)
-        if not isinstance(container, dict):
-            continue
+    for container in iter_container_objects(record):
         metrics = container.get("metrics", [])
         if not isinstance(metrics, list):
             continue
@@ -264,17 +364,84 @@ def walk_json(value: Any):
 
 
 
+def normalize_cpe_component(value: str) -> str:
+    cleaned = value.strip().lower().replace(" ", "_")
+    cleaned = cleaned.replace("/", "_")
+    return cleaned or "*"
+
+
+
+def is_concrete_version(value: str | None) -> bool:
+    if not value:
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    forbidden_fragments = ("<", ">", "=", " ", "*", ",", "||")
+    forbidden_values = {"all", "n/a", "na", "unspecified", "unknown", "none"}
+    lowered = text.lower()
+    if lowered in forbidden_values:
+        return False
+    return not any(fragment in text for fragment in forbidden_fragments)
+
+
+
+def build_synthetic_cpe(vendor: str, product: str, version: str) -> str:
+    return (
+        f"cpe:2.3:a:{normalize_cpe_component(vendor)}:"
+        f"{normalize_cpe_component(product)}:{normalize_cpe_component(version)}:*:*:*:*:*:*:*"
+    )
+
+
+
 def extract_cpe_list(record: dict[str, Any]) -> list[str]:
     found: list[str] = []
     seen: set[str] = set()
+
+    def add_cpe(value: str) -> None:
+        normalized = value.strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            found.append(normalized)
+
+    # 1. Сначала собираем готовые CPE, если они явно есть в записи.
     for item in walk_json(record):
         if not isinstance(item, str):
             continue
         for match in CPE_RE.findall(item):
-            normalized = match.strip()
-            if normalized not in seen:
-                seen.add(normalized)
-                found.append(normalized)
+            add_cpe(match)
+
+    # 2. Если готовых CPE нет или в них не хватает конкретных версий,
+    #    дополнительно синтезируем CPE из affected/vendor/product/versions.
+    for container in iter_container_objects(record):
+        affected_list = container.get("affected", [])
+        if not isinstance(affected_list, list):
+            continue
+
+        for affected in affected_list:
+            if not isinstance(affected, dict):
+                continue
+
+            vendor = str(affected.get("vendor") or "sqlite").strip()
+            product = str(affected.get("product") or "sqlite").strip()
+
+            cpes = affected.get("cpes", [])
+            if isinstance(cpes, list):
+                for cpe in cpes:
+                    if isinstance(cpe, str):
+                        add_cpe(cpe)
+
+            versions = affected.get("versions", [])
+            if not isinstance(versions, list):
+                continue
+
+            for version_item in versions:
+                if not isinstance(version_item, dict):
+                    continue
+                version_value = str(version_item.get("version") or "").strip()
+                if is_concrete_version(version_value):
+                    add_cpe(build_synthetic_cpe(vendor, product, version_value))
+
     return found
 
 
@@ -282,11 +449,8 @@ def extract_cpe_list(record: dict[str, Any]) -> list[str]:
 def extract_cwe_ids(record: dict[str, Any]) -> list[str]:
     found: list[str] = []
     seen: set[str] = set()
-    containers = record.get("containers", {})
 
-    for container in containers.values():
-        if not isinstance(container, dict):
-            continue
+    for container in iter_container_objects(record):
         problem_types = container.get("problemTypes", [])
         if not isinstance(problem_types, list):
             continue
